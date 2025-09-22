@@ -1,67 +1,113 @@
-name: Release
+name: Release by VERSION.txt
 
 on:
+  workflow_dispatch:   # 手动触发
   push:
-    tags:
-      - 'v*' # 当推送以 'v' 开头的标签时触发
+    branches:
+      - main           # 当 main 分支更新时自动触发
+  workflow_run:
+    workflows: ["Upstream Sync"]
+    types:
+      - completed     # 在 sync.yml 运行完成后自动触发
 
 permissions:
-  contents: write # 给 release 创建权限
+  contents: write
+  actions: write
 
 jobs:
   release:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout code
+      - name: Checkout repo (with tags)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          fetch-tags: true
 
-      # 先设置 Node.js 版本，保证后续 pnpm 用 Node v22
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: '22'
+      - name: Read version from VERSION.txt
+        id: version
+        run: |
+          if [ ! -f VERSION.txt ]; then
+            echo "VERSION.txt 文件不存在，退出"
+            exit 1
+          fi
+          VERSION=$(cat VERSION.txt | tr -d ' \n')
+          echo "VERSION=$VERSION" >> $GITHUB_ENV
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
 
-      - name: Setup pnpm
-        uses: pnpm/action-setup@v3
-        with:
-          version: 10.14.0
+      - name: Check if tag already exists
+        id: tag_exist
+        run: |
+          if git rev-parse "refs/tags/${{ env.VERSION }}" >/dev/null 2>&1; then
+            echo "Tag ${{ env.VERSION }} 已存在，跳过发布"
+            echo "tag_exists=true" >> $GITHUB_ENV
+            exit 0
+          else
+            echo "tag_exists=false" >> $GITHUB_ENV
+          fi
 
-      - name: Install dependencies
-        run: pnpm install --frozen-lockfile
+      - name: Create new tag
+        if: env.tag_exists == 'false'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag "${{ env.VERSION }}"
+          git push origin "${{ env.VERSION }}"
 
-      - name: Run convert-changelog script
-        run: node scripts/convert-changelog.js
-        env:
-          GITHUB_ACTIONS: 'true'
+      - name: Extract changelog or commit
+        id: changelog
+        run: |
+          CHANGELOG_FILE=""
+          if [ -f "CHANGELOG.md" ]; then
+            CHANGELOG_FILE="CHANGELOG.md"
+          elif [ -f "CHANGELOG" ]; then
+            CHANGELOG_FILE="CHANGELOG"
+          fi
+
+          CONTENT=""
+          if [ -n "$CHANGELOG_FILE" ]; then
+            # 匹配 ## [x.y.z] 或 ## x.y.z
+            CONTENT=$(awk "/^## *\\[?${{ env.VERSION }}\\]?/ {flag=1;next} /^## / {flag=0} flag {print}" $CHANGELOG_FILE)
+          fi
+
+          if [ -z "$CONTENT" ]; then
+            echo "未找到 CHANGELOG 对应版本，尝试使用最近一次提交日志"
+            CONTENT=$(git log -1 --pretty=format:"%s")
+          fi
+
+          if [ -z "$CONTENT" ]; then
+            echo "既无 CHANGELOG 也无提交日志，使用默认说明"
+            CONTENT="版本号来自 VERSION.txt"
+          fi
+
+          echo "提取到的内容："
+          echo "$CONTENT"
+
+          # 兼容多行 body
+          echo "CONTENT<<EOF" >> $GITHUB_ENV
+          echo "$CONTENT" >> $GITHUB_ENV
+          echo "EOF" >> $GITHUB_ENV
+
+      # 可选：上传 Release 附件
+      # - name: Upload Release Asset
+      #   uses: softprops/action-gh-release@v1
+      #   with:
+      #     tag_name: ${{ env.VERSION }}
+      #     name: ${{ env.VERSION }}
+      #     body: ${{ env.CONTENT }}
+      #     files: path/to/artifact.zip
+      #   env:
+      #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Create Release
-        uses: actions/create-release@v1
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ env.VERSION }}
+          name: ${{ env.VERSION }}
+          body: ${{ env.CONTENT }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ github.ref_name }}
-          release_name: Release ${{ github.ref_name }}
-          body: |
-            ## 变更日志
 
-            请查看 [CHANGELOG](CHANGELOG) 文件了解详细变更内容。
-
-            ## 下载
-
-            - [Source code (zip)](https://github.com/${{ github.repository }}/archive/${{ github.ref_name }}.zip)
-            - [Source code (tar.gz)](https://github.com/${{ github.repository }}/archive/${{ github.ref_name }}.tar.gz)
-          draft: false
-          prerelease: false
-
-      - name: Build project
-        run: pnpm run build
-
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-files
-          path: .next/
-          retention-days: 30
+      - name: Output release info
+        run: |
+          echo "Release ${{ env.VERSION }} 已完成"
